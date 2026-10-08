@@ -1,7 +1,7 @@
 """
-Strategy settings test on ~6 months of real BTC/USD history, fees included.
+Strategy settings test on ~6 months of real price history, fees included.
+Uses the coin in the SYMBOL variable (e.g. TAO/USD).
 Runs once at bot startup when the Railway variable RUN_OPTIMIZE=true.
-Results appear in the Railway logs.
 """
 import os
 import logging
@@ -16,32 +16,39 @@ from bot import add_indicators
 log = logging.getLogger("m15")
 
 DAYS = int(os.getenv("OPT_DAYS", "180"))
-SOURCES = [("coinbaseexchange", "BTC/USD"), ("bitstamp", "BTC/USD"), ("kraken", "BTC/USD")]
+MIN_DAYS = 60
+BASE = os.getenv("SYMBOL", "BTC/USD").split("/")[0]
+SOURCES = [("coinbaseexchange", f"{BASE}/USD"), ("kucoin", f"{BASE}/USDT"),
+           ("okx", f"{BASE}/USDT"), ("gateio", f"{BASE}/USDT"),
+           ("bitstamp", f"{BASE}/USD"), ("kraken", f"{BASE}/USD")]
 
 
 def fetch_history(days=DAYS):
-    """Page 15m candles from the first exchange that works."""
     for ex_id, sym in SOURCES:
         try:
             ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
+            ex.load_markets()
+            if sym not in ex.markets:
+                log.info("OPT %s doesn't list %s, trying next source", ex_id, sym)
+                continue
             since = ex.milliseconds() - days * 86400 * 1000
             rows = []
             while True:
                 batch = ex.fetch_ohlcv(sym, "15m", since=since, limit=300)
-                if not batch:
+                if not batch or batch[-1][0] < since:
                     break
                 rows += batch
                 since = batch[-1][0] + 900_000
                 if since >= ex.milliseconds() - 900_000:
                     break
-            if len(rows) > days * 96 * 0.8:
+            if len(rows) >= MIN_DAYS * 96:
                 df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
                 df = df.drop_duplicates("ts").sort_values("ts")
                 df.index = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                log.info("OPT data: %d x 15m candles from %s (%s to %s)",
-                         len(df), ex_id, df.index[0].date(), df.index[-1].date())
+                log.info("OPT data: %s, %d x 15m candles from %s (%s to %s)",
+                         sym, len(df), ex_id, df.index[0].date(), df.index[-1].date())
                 return df
-            log.info("OPT %s returned only %d candles, trying next source", ex_id, len(rows))
+            log.info("OPT %s returned only %d days, trying next source", ex_id, len(rows) // 96)
         except Exception as e:
             log.info("OPT %s failed: %s", ex_id, e)
     raise RuntimeError("No exchange returned enough history")
@@ -55,7 +62,6 @@ def resample(df, rule):
 
 
 def simulate(df, atr_sl, atr_tp, fee_pct, allow_shorts=True, risk_pct=1.0, start=1000.0):
-    """Fast version of the bot's exact rules. Returns stats dict."""
     d = add_indicators(df.copy())
     c, h, l = d.close.values, d.high.values, d.low.values
     ef, es, et, rsi, atr = (d.ema_fast.values, d.ema_slow.values, d.ema_trend.values,
