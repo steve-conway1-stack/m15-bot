@@ -1,4 +1,4 @@
-"
+"""
 Trend-following test: breakout entries + ATR trailing stop, vs buy-and-hold.
 Uses the coin in the SYMBOL variable (e.g. TAO/USD), fees included, no leverage.
 Runs once at bot startup when the Railway variable RUN_OPTIMIZE=true.
@@ -17,7 +17,7 @@ log = logging.getLogger("m15")
 
 DAYS = int(os.getenv("OPT_DAYS", "730"))
 MIN_DAYS = 180
-FEE = 0.4  # % per side, Kraken market orders
+FEE = 0.4
 BASE = os.getenv("SYMBOL", "BTC/USD").split("/")[0]
 SOURCES = [("coinbaseexchange", f"{BASE}/USD"), ("kucoin", f"{BASE}/USDT"),
            ("okx", f"{BASE}/USDT"), ("gateio", f"{BASE}/USDT"),
@@ -26,7 +26,6 @@ HOUR = 3_600_000
 
 
 def fetch_history(days=DAYS):
-    """Page 1h candles (up to 2 years) from the first exchange with enough history."""
     for ex_id, sym in SOURCES:
         try:
             ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
@@ -39,7 +38,6 @@ def fetch_history(days=DAYS):
             while True:
                 batch = ex.fetch_ohlcv(sym, "1h", since=since, limit=300)
                 if not batch:
-                    # coin may not have existed yet at 'since'; jump forward 300h
                     if not rows and since < ex.milliseconds() - 300 * HOUR:
                         since += 300 * HOUR
                         continue
@@ -68,19 +66,17 @@ def resample(df, rule):
     return df[list(agg)].resample(rule).agg(agg).dropna()
 
 
-START = 60  # first bar traded (needs 55 bars of lookback + ATR warm-up)
+START = 60
 
 
 def simulate(df, lookback, atr_mult, shorts, fee_pct=FEE, start=1000.0):
-    """Enter on close above the previous `lookback`-bar high (below low for shorts).
-    Exit on an ATR trailing stop. Whole balance per trade, no leverage."""
     d = add_indicators(df.copy())
     o, h, l, c, atr = d.open.values, d.high.values, d.low.values, d.close.values, d.atr.values
     hi = pd.Series(h).rolling(lookback).max().shift(1).values
     lo = pd.Series(l).rolling(lookback).min().shift(1).values
 
     bal, peak, max_dd = start, start, 0.0
-    pos = None  # [side, entry, qty, stop, best]
+    pos = None
     pnls, half_bal = [], None
     half = START + (len(c) - START) // 2
     for i in range(START, len(c)):
@@ -88,7 +84,7 @@ def simulate(df, lookback, atr_mult, shorts, fee_pct=FEE, start=1000.0):
             side, entry, qty, stop, best = pos
             exit_px = None
             if side == 1 and l[i] <= stop:
-                exit_px = min(o[i], stop)          # gap below stop fills at open
+                exit_px = min(o[i], stop)
             elif side == -1 and h[i] >= stop:
                 exit_px = max(o[i], stop)
             if exit_px is not None:
@@ -96,7 +92,7 @@ def simulate(df, lookback, atr_mult, shorts, fee_pct=FEE, start=1000.0):
                 bal += net
                 pnls.append(net)
                 pos = None
-            else:  # ratchet the trailing stop using this candle's close
+            else:
                 if side == 1:
                     best = max(best, c[i]); stop = max(stop, best - atr_mult * atr[i])
                 else:
@@ -107,13 +103,12 @@ def simulate(df, lookback, atr_mult, shorts, fee_pct=FEE, start=1000.0):
             if side:
                 qty = bal / c[i] / (1 + fee_pct / 100)
                 pos = [side, c[i], qty, c[i] - side * atr_mult * atr[i], c[i]]
-        # mark-to-market drawdown
         eq = bal + ((c[i] - pos[1]) * pos[2] * pos[0] if pos else 0)
         if i == half:
             half_bal = eq
         peak = max(peak, eq)
         max_dd = max(max_dd, (peak - eq) / peak)
-    if pos:  # close any open trade at the last price
+    if pos:
         side, entry, qty = pos[0], pos[1], pos[2]
         net = (c[-1] - entry) * qty * side - (entry + c[-1]) * qty * fee_pct / 100
         bal += net
