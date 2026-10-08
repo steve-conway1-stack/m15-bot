@@ -1,136 +1,177 @@
-     """
-Strategy settings test on ~6 months of real BTC/USD history, fees included.
-Runs once at bot startup when the Railway variable RUN_OPTIMIZE=true.
-Results appear in the Railway logs.
+"""
+M15 trading bot — EMA trend + RSI pullback, ATR-based stop/target.
+Runs on 15-minute candles via ccxt (Binance, Bybit, Kraken, etc.).
+
+DRY_RUN=true (default) = paper trading only. No real orders are sent.
 """
 import os
 import time
 import logging
-import itertools
- 
-import numpy as np
-import pandas as pd
+from datetime import datetime, timezone
+
 import ccxt
- 
-from bot import add_indicators
- 
+import pandas as pd
+
+# ---------- Config (set these as Railway variables) ----------
+EXCHANGE = os.getenv("EXCHANGE", "kraken")
+SYMBOL = os.getenv("SYMBOL", "BTC/USD")
+TIMEFRAME = "15m"
+RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))       # % of balance risked per trade
+ATR_SL = float(os.getenv("ATR_SL", "1.5"))           # stop = 1.5 x ATR
+ATR_TP = float(os.getenv("ATR_TP", "3.0"))           # target = 3 x ATR (1:2 R:R)
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() != "false"
+PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "1000"))
+FEE_PCT = float(os.getenv("FEE_PCT", "0.4"))         # exchange fee % per side (Kraken taker ~0.4)
+MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "1")) # 1 = position never bigger than balance
+ALLOW_SHORTS = os.getenv("ALLOW_SHORTS", "true").lower() != "false"  # Kraken spot can't short
+API_KEY = os.getenv("API_KEY", "")
+API_SECRET = os.getenv("API_SECRET", "")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("m15")
- 
-DAYS = int(os.getenv("OPT_DAYS", "180"))
-SOURCES = [("coinbaseexchange", "BTC/USD"), ("bitstamp", "BTC/USD"), ("kraken", "BTC/USD")]
- 
- 
-def fetch_history(days=DAYS):
-    """Page 15m candles from the first exchange that works."""
-    for ex_id, sym in SOURCES:
+
+
+# ---------- Indicators ----------
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["ema_fast"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=50, adjust=False).mean()
+    df["ema_trend"] = df["close"].ewm(span=200, adjust=False).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    df["rsi"] = 100 - 100 / (1 + gain / loss)
+
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    return df
+
+
+def signal(df: pd.DataFrame) -> str | None:
+    """Look at the last CLOSED candle only."""
+    c, p = df.iloc[-1], df.iloc[-2]
+    uptrend = c.close > c.ema_trend and c.ema_fast > c.ema_slow
+    downtrend = c.close < c.ema_trend and c.ema_fast < c.ema_slow
+    # Pullback: RSI dipped and is turning back with the trend
+    if uptrend and p.rsi < 45 <= c.rsi:
+        return "long"
+    if downtrend and p.rsi > 55 >= c.rsi:
+        return "short"
+    return None
+
+
+# ---------- Position maths (shared with backtest) ----------
+def open_position(sig, c, balance):
+    """Size by risk, then cap so the position never exceeds balance x MAX_LEVERAGE."""
+    stop_dist = c.atr * ATR_SL
+    qty = (balance * RISK_PCT / 100) / stop_dist
+    qty = min(qty, balance * MAX_LEVERAGE / c.close)
+    entry = c.close
+    sl = entry - stop_dist if sig == "long" else entry + stop_dist
+    tp = entry + c.atr * ATR_TP if sig == "long" else entry - c.atr * ATR_TP
+    return dict(side=sig, entry=entry, sl=sl, tp=tp, qty=qty)
+
+
+def check_exit(pos, c):
+    """Return (exit_price, reason) if SL/TP was touched in this candle, else None.
+    If both were touched, assume the stop was hit first (conservative)."""
+    long_ = pos["side"] == "long"
+    hit_sl = c.low <= pos["sl"] if long_ else c.high >= pos["sl"]
+    hit_tp = c.high >= pos["tp"] if long_ else c.low <= pos["tp"]
+    if hit_sl:
+        return pos["sl"], "SL"
+    if hit_tp:
+        return pos["tp"], "TP"
+    return None
+
+
+def trade_pnl(pos, exit_px):
+    """Net PnL after fees on both entry and exit."""
+    sign = 1 if pos["side"] == "long" else -1
+    gross = (exit_px - pos["entry"]) * pos["qty"] * sign
+    fees = (pos["entry"] + exit_px) * pos["qty"] * FEE_PCT / 100
+    return gross - fees, gross, fees
+
+
+def wanted(sig):
+    return sig and (sig == "long" or ALLOW_SHORTS)
+
+
+# ---------- Exchange helpers ----------
+def make_exchange():
+    ex = getattr(ccxt, EXCHANGE)({
+        "apiKey": API_KEY, "secret": API_SECRET, "enableRateLimit": True,
+    })
+    ex.load_markets()
+    return ex
+
+
+def fetch_candles(ex, limit=300) -> pd.DataFrame:
+    raw = ex.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=limit)
+    df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df.iloc[:-1].reset_index(drop=True)  # drop the still-forming candle
+
+
+def sleep_to_next_candle():
+    now = time.time()
+    nxt = (now // 900 + 1) * 900 + 5  # 5s after each 15-min close
+    time.sleep(max(1, nxt - now))
+
+
+# ---------- Main loop ----------
+def main():
+    ex = make_exchange()
+    balance = PAPER_BALANCE
+    pos = None  # dict(side, entry, sl, tp, qty)
+    log.info("Starting %s %s %s | DRY_RUN=%s", EXCHANGE, SYMBOL, TIMEFRAME, DRY_RUN)
+
+    while True:
         try:
-            ex = getattr(ccxt, ex_id)({"enableRateLimit": True})
-            since = ex.milliseconds() - days * 86400 * 1000
-            rows = []
-            while True:
-                batch = ex.fetch_ohlcv(sym, "15m", since=since, limit=300)
-                if not batch:
-                    break
-                rows += batch
-                since = batch[-1][0] + 900_000
-                if since >= ex.milliseconds() - 900_000:
-                    break
-            if len(rows) > days * 96 * 0.8:  # got at least 80% of expected candles
-                df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"])
-                df = df.drop_duplicates("ts").sort_values("ts")
-                df.index = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                log.info("OPT data: %d x 15m candles from %s (%s to %s)",
-                         len(df), ex_id, df.index[0].date(), df.index[-1].date())
-                return df
-            log.info("OPT %s returned only %d candles, trying next source", ex_id, len(rows))
+            df = add_indicators(fetch_candles(ex))
+            c = df.iloc[-1]
+
+            # Manage open position (checks candle high/low against SL/TP)
+            if pos:
+                hit = check_exit(pos, c)
+                if hit:
+                    exit_px, reason = hit
+                    pnl, gross, fees = trade_pnl(pos, exit_px)
+                    balance += pnl
+                    log.info("EXIT %s @ %.2f (%s) gross %.2f fees %.2f NET %.2f | balance %.2f",
+                             pos["side"], exit_px, reason, gross, fees, pnl, balance)
+                    if not DRY_RUN:
+                        ex.create_market_order(SYMBOL, "sell" if pos["side"] == "long" else "buy",
+                                               pos["qty"], params={"reduceOnly": True})
+                    pos = None
+                else:
+                    unreal, _, _ = trade_pnl(pos, c.close)
+                    log.info("IN TRADE %s | close %.2f | SL %.2f TP %.2f | unrealised net %.2f",
+                             pos["side"], c.close, pos["sl"], pos["tp"], unreal)
+
+            # Look for new entry
+            if not pos:
+                sig = signal(df)
+                if wanted(sig):
+                    pos = open_position(sig, c, balance)
+                    pos["qty"] = float(ex.amount_to_precision(SYMBOL, pos["qty"]))
+                    log.info("ENTRY %s qty %.6f ($%.0f) @ %.2f SL %.2f TP %.2f",
+                             sig, pos["qty"], pos["qty"] * pos["entry"],
+                             pos["entry"], pos["sl"], pos["tp"])
+                    if not DRY_RUN:
+                        ex.create_market_order(SYMBOL, "buy" if sig == "long" else "sell", pos["qty"])
+                else:
+                    log.info("No signal | close %.2f RSI %.1f | balance %.2f",
+                             c.close, c.rsi, balance)
         except Exception as e:
-            log.info("OPT %s failed: %s", ex_id, e)
-    raise RuntimeError("No exchange returned enough history")
- 
- 
-def resample(df, rule):
-    if rule == "15m":
-        return df[["open", "high", "low", "close", "volume"]].copy()
-    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
-    return df.resample(rule.replace("m", "min").replace("h", "h")).agg(agg).dropna()
- 
- 
-def simulate(df, atr_sl, atr_tp, fee_pct, allow_shorts=True, risk_pct=1.0, start=1000.0):
-    """Fast version of the bot's exact rules. Returns stats dict."""
-    d = add_indicators(df.copy())
-    c, h, l = d.close.values, d.high.values, d.low.values
-    ef, es, et, rsi, atr = (d.ema_fast.values, d.ema_slow.values, d.ema_trend.values,
-                            d.rsi.values, d.atr.values)
-    up = (c > et) & (ef > es)
-    dn = (c < et) & (ef < es)
-    prsi = np.roll(rsi, 1)
-    long_sig = up & (prsi < 45) & (rsi >= 45)
-    short_sig = dn & (prsi > 55) & (rsi <= 55) & allow_shorts
- 
-    bal, peak, max_dd = start, start, 0.0
-    pos = None
-    pnls, half_bal = [], None
-    half = len(c) // 2
-    for i in range(200, len(c)):
-        if i == half:
-            half_bal = bal
-        if pos:
-            side, entry, sl, tp, qty = pos
-            if side == 1:
-                hit = sl if l[i] <= sl else (tp if h[i] >= tp else None)
-            else:
-                hit = sl if h[i] >= sl else (tp if l[i] <= tp else None)
-            if hit is not None:
-                net = (hit - entry) * qty * side - (entry + hit) * qty * fee_pct / 100
-                bal += net
-                pnls.append(net)
-                peak = max(peak, bal)
-                max_dd = max(max_dd, (peak - bal) / peak)
-                pos = None
-        if not pos and (long_sig[i] or short_sig[i]):
-            side = 1 if long_sig[i] else -1
-            dist = atr[i] * atr_sl
-            qty = min(bal * risk_pct / 100 / dist, bal / c[i])  # no leverage
-            pos = (side, c[i], c[i] - side * dist, c[i] + side * atr[i] * atr_tp, qty)
-    half_bal = half_bal or bal
-    wins = sum(p > 0 for p in pnls)
-    return dict(trades=len(pnls), win=wins / max(1, len(pnls)),
-                ret=(bal / start - 1) * 100,
-                h1=(half_bal / start - 1) * 100,
-                h2=(bal / half_bal - 1) * 100,
-                dd=max_dd * 100)
- 
- 
-def run_optimize():
-    log.info("OPT ===== settings test starting (takes a few minutes) =====")
-    raw = fetch_history()
-    results = []
-    for tf in ("15m", "1h", "4h"):
-        df = resample(raw, tf)
-        for sl, rr, fee, shorts in itertools.product(
-                (1.5, 2.0, 3.0), (2, 3), (0.4, 0.25), (True, False)):
-            r = simulate(df, sl, sl * rr, fee, shorts)
-            r.update(tf=tf, sl=sl, tp=sl * rr, fee=fee, shorts=shorts)
-            results.append(r)
-    results.sort(key=lambda r: r["ret"], reverse=True)
- 
-    log.info("OPT %-4s %-4s %-4s %-5s %-6s | %6s %5s | %7s %7s %7s | %6s",
-             "TF", "SL", "TP", "fee", "shorts", "trades", "win", "return", "1st½", "2nd½", "maxDD")
-    current = [r for r in results if r["tf"] == "15m" and r["sl"] == 1.5 and r["tp"] == 3.0
-               and r["fee"] == 0.4 and r["shorts"]]
-    for n, r in enumerate(results[:15] + [None] + current):
-        if r is None:
-            log.info("OPT ----- your current settings (rank %d of %d): -----",
-                     results.index(current[0]) + 1, len(results))
-            continue
-        log.info("OPT %-4s %-4.1f %-4.1f %-5.2f %-6s | %6d %4.0f%% | %+6.1f%% %+6.1f%% %+6.1f%% | %5.1f%%",
-                 r["tf"], r["sl"], r["tp"], r["fee"], "yes" if r["shorts"] else "no",
-                 r["trades"], r["win"] * 100, r["ret"], r["h1"], r["h2"], r["dd"])
-    log.info("OPT ===== done. Best rows are at the top. =====")
-    return results
- 
- 
+            log.exception("Loop error: %s", e)
+
+        sleep_to_next_candle()
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-    run_optimize()
- 
+    main()
